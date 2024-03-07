@@ -32,7 +32,7 @@ impl<T> Ord for Schedule<T> {
 }
 impl<T> PartialOrd for Schedule<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.date.partial_cmp(&other.date).map(|ord| ord.reverse())
+        Some(self.cmp(other))
     }
 }
 impl<T> Eq for Schedule<T> {}
@@ -160,7 +160,7 @@ where
             AtMost(Duration),
         }
 
-        let ref waiter = *self.waiter;
+        let waiter = &(*self.waiter);
         loop {
             let mut sleep = if let Some(sched) = self.heap.peek() {
                 let now = Instant::now();
@@ -228,7 +228,7 @@ where
                     let _ = waiter.condvar.wait(lock);
                 }
                 Sleep::AtMost(delay) => {
-                     let sec = delay.as_secs();
+                    let sec = delay.as_secs();
                     let ns = delay.subsec_nanos();
                     let duration = Duration::new(sec, ns);
                     let _ = waiter.condvar.wait_timeout(lock, duration);
@@ -289,7 +289,7 @@ where
         let (tx, rx) = channel();
         thread::spawn(move || {
             use Op::*;
-            let ref waiter = *waiter_send;
+            let waiter = &(*waiter_send);
             for msg in rx.iter() {
                 let mut vec = waiter.messages.lock().unwrap();
                 match msg {
@@ -340,7 +340,7 @@ where
     }
 }
 
-/// A timer, used to schedule execution of callbacks at a later date.
+/// A monotonic timer, used to schedule execution of callbacks at a later date.
 ///
 /// In the current implementation, each timer is executed as two
 /// threads. The _Scheduler_ thread is in charge of maintaining the
@@ -355,7 +355,7 @@ pub struct Timer {
 impl Timer {
     /// Create a timer.
     ///
-    /// This immediatey launches two threads, which will remain
+    /// This immediately launches two threads, which will remain
     /// launched until the timer is dropped. As expected, the threads
     /// spend most of their life waiting for instructions.
     pub fn new() -> Self {
@@ -516,7 +516,13 @@ impl Timer {
     }
 }
 
-/// A timer, used to schedule delivery of messages at a later date.
+impl Default for Timer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A monotonic timer, used to schedule delivery of messages at a later date.
 ///
 /// In the current implementation, each timer is executed as two
 /// threads. The _Scheduler_ thread is in charge of maintaining the
@@ -544,7 +550,7 @@ where
 {
     /// Create a message timer.
     ///
-    /// This immediatey launches two threads, which will remain
+    /// This immediately launches two threads, which will remain
     /// launched until the timer is dropped. As expected, the threads
     /// spend most of their life waiting for instructions.
     pub fn new(tx: Sender<T>) -> Self {
