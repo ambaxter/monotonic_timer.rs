@@ -1,10 +1,6 @@
 //! A simple timer, used to enqueue operations meant to be executed at
 //! a given time or after a given delay.
 
-extern crate chrono;
-
-use chrono::offset::Utc;
-use chrono::{DateTime, Duration};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::AtomicBool;
@@ -12,11 +8,12 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// An item scheduled for delayed execution.
 struct Schedule<T> {
     /// The instant at which to execute.
-    date: DateTime<Utc>,
+    date: Instant,
 
     /// The schedule data.
     data: T,
@@ -55,7 +52,7 @@ enum Op<T> {
 }
 
 /// A mutex-based kind-of-channel used to communicate between the
-/// Communication thread and the Scheuler thread.
+/// Communication thread and the Scheduler thread.
 struct WaiterChannel<T> {
     /// Pending messages.
     messages: Mutex<Vec<Op<T>>>,
@@ -150,8 +147,8 @@ where
 {
     fn with_capacity(waiter: Arc<WaiterChannel<T>>, executor: E, capacity: usize) -> Self {
         Scheduler {
-            waiter: waiter,
-            executor: executor,
+            waiter,
+            executor,
             heap: BinaryHeap::with_capacity(capacity),
         }
     }
@@ -166,11 +163,11 @@ where
         let ref waiter = *self.waiter;
         loop {
             let mut sleep = if let Some(sched) = self.heap.peek() {
-                let now = chrono::offset::Utc::now();
+                let now = Instant::now();
                 if sched.date > now {
                     // First item is not ready yet, so we need to
                     // wait until it is or something happens.
-                    Sleep::AtMost(sched.date.signed_duration_since(now))
+                    Sleep::AtMost(sched.date.duration_since(now))
                 } else {
                     // At this stage, we have an item that has reached
                     // execution time. The `unwrap()` is guaranteed to
@@ -188,7 +185,7 @@ where
                             // enqueue the next call.
                             self.heap.push(Schedule {
                                 date: sched.date + delta,
-                                data: data,
+                                data,
                                 guard: sched.guard,
                                 repeat: Some(delta),
                             });
@@ -231,9 +228,9 @@ where
                     let _ = waiter.condvar.wait(lock);
                 }
                 Sleep::AtMost(delay) => {
-                    let sec = delay.num_seconds();
-                    let ns = (delay - Duration::seconds(sec)).num_nanoseconds().unwrap(); // This `unwrap()` asserts that the number of ns is not > 1_000_000_000. Since we just substracted the number of seconds, the assertion should always pass.
-                    let duration = std::time::Duration::new(sec as u64, ns as u32);
+                     let sec = delay.as_secs();
+                    let ns = delay.subsec_nanos();
+                    let duration = Duration::new(sec, ns);
                     let _ = waiter.condvar.wait_timeout(lock, duration);
                 }
                 Sleep::NotAtAll => {}
@@ -268,7 +265,7 @@ where
 {
     /// Create a timer base.
     ///
-    /// This immediatey launches two threads, which will remain
+    /// This immediately launches two threads, which will remain
     /// launched until the timer is dropped. As expected, the threads
     /// spend most of their life waiting for instructions.
     fn new<E>(executor: E) -> Self
@@ -278,7 +275,7 @@ where
         Self::with_capacity(executor, 32)
     }
 
-    /// As `new()`, but with a manually specified initial capaicty.
+    /// As `new()`, but with a manually specified initial capacity.
     fn with_capacity<E>(executor: E, capacity: usize) -> Self
     where
         E: 'static + Executor<T> + Send,
@@ -302,7 +299,7 @@ where
                     }
                     Stop => {
                         vec.clear();
-                        vec.push(Op::Stop);
+                        vec.push(Stop);
                         waiter.condvar.notify_one();
                         return;
                     }
@@ -318,35 +315,25 @@ where
                 scheduler.run()
             })
             .unwrap();
-        TimerBase { tx: tx }
+        TimerBase { tx }
     }
 
     pub fn schedule_with_delay(&self, delay: Duration, data: T) -> Guard {
-        self.schedule_with_date(Utc::now() + delay, data)
-    }
-
-    pub fn schedule_with_date<D>(&self, date: DateTime<D>, data: T) -> Guard
-    where
-        D: chrono::offset::TimeZone,
-    {
-        self.schedule(date, None, data)
+        self.schedule(Instant::now() + delay, None, data)
     }
 
     pub fn schedule_repeating(&self, repeat: Duration, data: T) -> Guard {
-        self.schedule(Utc::now() + repeat, Some(repeat), data)
+        self.schedule(Instant::now() + repeat, Some(repeat), data)
     }
 
-    pub fn schedule<D>(&self, date: DateTime<D>, repeat: Option<Duration>, data: T) -> Guard
-    where
-        D: chrono::offset::TimeZone,
-    {
+    pub fn schedule(&self, date: Instant, repeat: Option<Duration>, data: T) -> Guard {
         let guard = Guard::new();
         self.tx
             .send(Op::Schedule(Schedule {
-                date: date.with_timezone(&Utc),
-                data: data,
+                date,
+                data,
                 guard: guard.clone(),
-                repeat: repeat,
+                repeat,
             }))
             .unwrap();
         guard
@@ -377,7 +364,7 @@ impl Timer {
         }
     }
 
-    /// As `new()`, but with a manually specified initial capaicty.
+    /// As `new()`, but with a manually specified initial capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Timer {
             base: TimerBase::with_capacity(CallbackExecutor, capacity),
@@ -411,14 +398,13 @@ impl Timer {
     /// # Example
     ///
     /// ```
-    /// extern crate timer;
-    /// extern crate chrono;
+    /// extern crate monotonic_timer;
     /// use std::sync::mpsc::channel;
-    ///
-    /// let timer = timer::Timer::new();
+    /// use std::time::Duration;
+    /// let timer = monotonic_timer::Timer::new();
     /// let (tx, rx) = channel();
     ///
-    /// let _guard = timer.schedule_with_delay(chrono::Duration::seconds(3), move || {
+    /// let _guard = timer.schedule_with_delay(Duration::from_secs(3), move || {
     ///   // This closure is executed on the scheduler thread,
     ///   // so we want to move it away asap.
     ///
@@ -433,38 +419,6 @@ impl Timer {
         F: 'static + FnMut() + Send,
     {
         self.base.schedule_with_delay(delay, Box::new(cb))
-    }
-
-    /// Schedule a callback for execution at a given date.
-    ///
-    /// Callbacks are guaranteed to never be called before their
-    /// date. However, it is possible that they will be called a
-    /// little after it.
-    ///
-    /// If the date is in the past, the callback is executed as soon
-    /// as possible.
-    ///
-    /// This method returns a `Guard` object. If that `Guard` is
-    /// dropped, execution is cancelled.
-    ///
-    ///
-    /// # Performance
-    ///
-    /// The callback is executed on the Scheduler thread. It should
-    /// therefore terminate very quickly, or risk causing delaying
-    /// other callbacks.
-    ///
-    /// # Failures
-    ///
-    /// Any failure in `cb` will scheduler thread and progressively
-    /// contaminate the Timer and the calling thread itself. You have
-    /// been warned.
-    pub fn schedule_with_date<F, T>(&self, date: DateTime<T>, cb: F) -> Guard
-    where
-        F: 'static + FnMut() + Send,
-        T: chrono::offset::TimeZone,
-    {
-        self.base.schedule_with_date(date, Box::new(cb))
     }
 
     /// Schedule a callback for execution once per interval.
@@ -492,36 +446,35 @@ impl Timer {
     /// # Example
     ///
     /// ```
-    /// extern crate timer;
-    /// extern crate chrono;
+    /// extern crate monotonic_timer;
     /// use std::thread;
     /// use std::sync::{Arc, Mutex};
-    ///
-    /// let timer = timer::Timer::new();
+    /// use std::time::Duration;
+    /// let timer = monotonic_timer::Timer::new();
     /// // Number of times the callback has been called.
     /// let count = Arc::new(Mutex::new(0));
     ///
     /// // Start repeating. Each callback increases `count`.
     /// let guard = {
     ///   let count = count.clone();
-    ///   timer.schedule_repeating(chrono::Duration::milliseconds(5), move || {
+    ///   timer.schedule_repeating(Duration::from_millis(5), move || {
     ///     *count.lock().unwrap() += 1;
     ///   })
     /// };
     ///
     /// // Sleep one second. The callback should be called ~200 times.
-    /// thread::sleep(std::time::Duration::new(1, 0));
+    /// thread::sleep(Duration::from_secs(1));
     /// let count_result = *count.lock().unwrap();
     /// assert!(190 <= count_result && count_result <= 210,
     ///   "The timer was called {} times", count_result);
     ///
     /// // Now drop the guard. This should stop the timer.
     /// drop(guard);
-    /// thread::sleep(std::time::Duration::new(0, 100));
+    /// thread::sleep(Duration::new(0, 100));
     ///
     /// // Let's check that the count stops increasing.
     /// let count_start = *count.lock().unwrap();
-    /// thread::sleep(std::time::Duration::new(1, 0));
+    /// thread::sleep(Duration::from_secs(1));
     /// let count_stop =  *count.lock().unwrap();
     /// assert_eq!(count_start, count_stop);
     /// ```
@@ -555,10 +508,9 @@ impl Timer {
     /// Any failure in `cb` will scheduler thread and progressively
     /// contaminate the Timer and the calling thread itself. You have
     /// been warned.
-    pub fn schedule<F, T>(&self, date: DateTime<T>, repeat: Option<Duration>, cb: F) -> Guard
+    pub fn schedule<F>(&self, date: Instant, repeat: Option<Duration>, cb: F) -> Guard
     where
         F: 'static + FnMut() + Send,
-        T: chrono::offset::TimeZone,
     {
         self.base.schedule(date, repeat, Box::new(cb))
     }
@@ -597,14 +549,14 @@ where
     /// spend most of their life waiting for instructions.
     pub fn new(tx: Sender<T>) -> Self {
         MessageTimer {
-            base: TimerBase::new(DeliveryExecutor { tx: tx }),
+            base: TimerBase::new(DeliveryExecutor { tx }),
         }
     }
 
-    /// As `new()`, but with a manually specified initial capaicty.
+    /// As `new()`, but with a manually specified initial capacity.
     pub fn with_capacity(tx: Sender<T>, capacity: usize) -> Self {
         MessageTimer {
-            base: TimerBase::with_capacity(DeliveryExecutor { tx: tx }, capacity),
+            base: TimerBase::with_capacity(DeliveryExecutor { tx }, capacity),
         }
     }
 
@@ -624,38 +576,20 @@ where
     /// # Example
     ///
     /// ```
-    /// extern crate timer;
-    /// extern crate chrono;
+    /// extern crate monotonic_timer;
+    ///
     /// use std::sync::mpsc::channel;
+    /// use std::time::Duration;
     ///
     /// let (tx, rx) = channel();
-    /// let timer = timer::MessageTimer::new(tx);
-    /// let _guard = timer.schedule_with_delay(chrono::Duration::seconds(3), 3);
+    /// let timer = monotonic_timer::MessageTimer::new(tx);
+    /// let _guard = timer.schedule_with_delay(Duration::from_secs(3), 3);
     ///
     /// rx.recv().unwrap();
     /// println!("This code has been executed after 3 seconds");
     /// ```
     pub fn schedule_with_delay(&self, delay: Duration, msg: T) -> Guard {
         self.base.schedule_with_delay(delay, msg)
-    }
-
-    /// Schedule a message for delivery at a given date.
-    ///
-    /// Messages are guaranteed to never be delivered before their
-    /// date. However, it is possible that they will be delivered a
-    /// little after it.
-    ///
-    /// If the date is in the past, the message is delivered as soon
-    /// as possible.
-    ///
-    /// This method returns a `Guard` object. If that `Guard` is
-    /// dropped, delivery is cancelled.
-    ///
-    pub fn schedule_with_date<D>(&self, date: DateTime<D>, msg: T) -> Guard
-    where
-        D: chrono::offset::TimeZone,
-    {
-        self.base.schedule_with_date(date, msg)
     }
 
     /// Schedule a message for delivery once per interval.
@@ -683,15 +617,15 @@ where
     /// # Example
     ///
     /// ```
-    /// extern crate timer;
-    /// extern crate chrono;
+    /// extern crate monotonic_timer;
     /// use std::sync::mpsc::channel;
+    /// use std::time::Duration;
     ///
     /// let (tx, rx) = channel();
-    /// let timer = timer::MessageTimer::new(tx);
+    /// let timer = monotonic_timer::MessageTimer::new(tx);
     ///
     /// // Start repeating.
-    /// let guard = timer.schedule_repeating(chrono::Duration::milliseconds(5), 0);
+    /// let guard = timer.schedule_repeating(Duration::from_millis(5), 0);
     ///
     /// let mut count = 0;
     /// while count < 5 {
@@ -726,10 +660,7 @@ where
     /// Any failure in cloning of messages will occur on the scheduler thread
     /// and will contaminate the Timer and the calling thread itself. You have
     /// been warned.
-    pub fn schedule<D>(&self, date: DateTime<D>, repeat: Option<Duration>, msg: T) -> Guard
-    where
-        D: chrono::offset::TimeZone,
-    {
+    pub fn schedule<D>(&self, date: Instant, repeat: Option<Duration>, msg: T) -> Guard {
         self.base.schedule(date, repeat, msg)
     }
 }
@@ -772,10 +703,10 @@ impl Drop for Guard {
 mod tests {
     extern crate std;
     use super::*;
-    use chrono::{Duration, Utc};
     use std::sync::mpsc::channel;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_schedule_with_delay() {
@@ -785,12 +716,12 @@ mod tests {
 
         // Schedule a number of callbacks in an arbitrary order, make sure
         // that they are executed in the right order.
-        let mut delays = vec![1, 5, 3, -1];
-        let start = Utc::now();
+        let mut delays = vec![1, 5, 3, 0];
+        let start = Instant::now();
         for i in delays.clone() {
             println!("Scheduling for execution in {} seconds", i);
             let tx = tx.clone();
-            guards.push(timer.schedule_with_delay(Duration::seconds(i), move || {
+            guards.push(timer.schedule_with_delay(Duration::from_secs(i), move || {
                 println!("Callback {}", i);
                 tx.send(i).unwrap();
             }));
@@ -798,7 +729,7 @@ mod tests {
 
         delays.sort();
         for (i, msg) in (0..delays.len()).zip(rx.iter()) {
-            let elapsed = Utc::now().signed_duration_since(start).num_seconds();
+            let elapsed = start.elapsed().as_secs();
             println!("Received message {} after {} seconds", msg, elapsed);
             assert_eq!(msg, delays[i]);
             assert!(
@@ -812,30 +743,30 @@ mod tests {
 
         // Now make sure that callbacks that are designed to be executed
         // immediately are executed quickly.
-        let start = Utc::now();
+        let start = Instant::now();
         for i in vec![10, 0] {
             println!("Scheduling for execution in {} seconds", i);
             let tx = tx.clone();
-            guards.push(timer.schedule_with_delay(Duration::seconds(i), move || {
+            guards.push(timer.schedule_with_delay(Duration::from_secs(i), move || {
                 println!("Callback {}", i);
                 tx.send(i).unwrap();
             }));
         }
 
         assert_eq!(rx.recv().unwrap(), 0);
-        assert!(Utc::now().signed_duration_since(start) <= Duration::seconds(1));
+        assert!(start.elapsed() <= Duration::from_secs(1));
     }
 
     #[test]
     fn test_message_timer() {
         let (tx, rx) = channel();
         let timer = MessageTimer::new(tx);
-        let start = Utc::now();
+        let start = Instant::now();
 
         let mut delays = vec![400, 300, 100, 500, 200];
         for delay in delays.clone() {
             timer
-                .schedule_with_delay(Duration::milliseconds(delay), delay)
+                .schedule_with_delay(Duration::from_millis(delay), delay)
                 .ignore();
         }
 
@@ -843,7 +774,7 @@ mod tests {
         for delay in delays {
             assert_eq!(rx.recv().unwrap(), delay);
         }
-        assert!(Utc::now().signed_duration_since(start) <= Duration::seconds(1));
+        assert!(start.elapsed() <= Duration::from_secs(1));
     }
 
     #[test]
@@ -854,12 +785,12 @@ mod tests {
 
         for i in 0..10 {
             let called = called.clone();
-            timer.schedule_with_delay(Duration::milliseconds(i), move || {
+            timer.schedule_with_delay(Duration::from_millis(i), move || {
                 *called.lock().unwrap() = true;
             });
         }
 
-        thread::sleep(std::time::Duration::new(1, 0));
+        thread::sleep(Duration::from_secs(1));
         assert_eq!(*called.lock().unwrap(), false);
     }
 
@@ -871,13 +802,13 @@ mod tests {
         {
             let called = called.clone();
             timer
-                .schedule_with_delay(Duration::milliseconds(1), move || {
+                .schedule_with_delay(Duration::from_millis(1), move || {
                     *called.lock().unwrap() = true;
                 })
                 .ignore();
         }
 
-        thread::sleep(std::time::Duration::new(1, 0));
+        thread::sleep(Duration::from_secs(1));
         assert_eq!(*called.lock().unwrap(), true);
     }
 
@@ -896,10 +827,10 @@ mod tests {
         let (tx, rx) = channel();
         let timer = MessageTimer::new(tx);
         timer
-            .schedule_with_delay(Duration::milliseconds(0), NoCloneMessage)
+            .schedule_with_delay(Duration::from_millis(0), NoCloneMessage)
             .ignore();
         timer
-            .schedule_with_delay(Duration::milliseconds(0), NoCloneMessage)
+            .schedule_with_delay(Duration::from_millis(0), NoCloneMessage)
             .ignore();
 
         for _ in 0..2 {
@@ -921,8 +852,8 @@ mod tests {
             let was_called = was_called.clone();
             // Schedule a task longer than repeat time
             timer
-                .schedule(Utc::now(), Some(Duration::milliseconds(10)), move || {
-                    thread::sleep(std::time::Duration::from_millis(30));
+                .schedule(Instant::now(), Some(Duration::from_millis(10)), move || {
+                    thread::sleep(Duration::from_millis(30));
                     *was_called.lock().unwrap() = true;
                 })
                 .ignore();
@@ -930,15 +861,15 @@ mod tests {
 
             // Now schedule another task.
             timer
-                .schedule(Utc::now(), None, move || {
-                    thread::sleep(std::time::Duration::from_millis(30));
+                .schedule(Instant::now(), None, move || {
+                    thread::sleep(Duration::from_millis(30));
                     *was_called_2.lock().unwrap() = true;
                 })
                 .ignore();
         }
 
         // Check that both our tasks were executed.
-        thread::sleep(std::time::Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(150));
         assert!(
             *was_called.lock().unwrap(),
             "Periodic task should have been called"
@@ -954,9 +885,9 @@ mod tests {
         // Check that the periodic task isn't executed anymore.
         // First, we wait in case we haven't finished executing it,
         // then we reset it and check that it isn't executed.
-        thread::sleep(std::time::Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(150));
         *was_called.lock().unwrap() = false;
-        thread::sleep(std::time::Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
         assert!(
             !*was_called.lock().unwrap(),
             "Task should have been stopped when the timer dropped"

@@ -1,14 +1,11 @@
 [package]
-name = "timer"
-version = "0.2.0"
-authors = ["David Teller <yoric@rajtel.name>"]
-description = "A simple timer. Use it to schedule execution of closures after a delay or at a given timestamp."
-documentation = "http://yoric.github.io/timer.rs/doc/timer/"
-repository = "https://github.com/Yoric/timer.rs"
+name = "monotonic-timer"
+version = "1.0.0"
+authors = ["Adam Baxter", "David Teller <yoric@rajtel.name>"]
+description = "A simple monotonic timer. Use it to schedule execution of closures after a delay."
+repository = "https://github.com/ambaxter/monotonic_timer.rs.git"
 readme = "README.md"
 keywords = ["timer", "alarm", "schedule", "chrono", "chronometer"]
 license = "MPL-2.0"
+edition = "2021"
 
-
-[dependencies]
-chrono = { version = "^0.4", default-features = false, features = ["clock"] }
